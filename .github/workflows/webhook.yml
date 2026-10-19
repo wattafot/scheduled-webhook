@@ -3,7 +3,7 @@ name: Scheduled webhook
 on:
   workflow_dispatch:
   schedule:
-    - cron: '3-58/5 * * * *'
+    - cron: '3/5 * * * *'
     - cron: '43 9 1 * *'
 
 permissions: {}
