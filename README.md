@@ -23,6 +23,24 @@ preventing the 60-day inactivity shutdown of public scheduled workflows. The
 request job has no repository permissions; only the heartbeat job can write.
 Manual dispatch exercises both jobs.
 
+## Temporary startup bridge
+
+New schedules can take time to begin firing. `bootstrap.yml` provides a temporary
+five-minute bridge during that startup period. It verifies the endpoint, queues
+one successor under workflow concurrency, and invokes the endpoint every five
+minutes for up to 50 minutes. The pending successor continues if the normal
+schedule has not started yet. An individual endpoint failure is retried during
+the next cycle. Response bodies remain private.
+
+As soon as a recent successful **scheduled** run of `webhook.yml` also confirms
+its `invoke` job succeeded, the bridge stops; its queued successor verifies the
+same state and exits without queuing another. Manual tests and monthly heartbeat
+runs do not satisfy this condition. This uses standard public runners and no
+personal access token. Only use this bridge for schedule startup or recovery.
+
+To stop the bridge manually, set `WEBHOOK_ENABLED=false` and cancel both its
+running and pending runs. The variable also prevents further scheduled requests.
+
 To pause requests, set `WEBHOOK_ENABLED=false`. For failures, check the Actions
 run and the private endpoint's health and logs. Rotate both endpoint authorization
 and `WEBHOOK_TOKEN` together. Configure GitHub Actions failure notifications in

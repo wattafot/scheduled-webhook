@@ -1,0 +1,106 @@
+name: Temporary scheduler bridge
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: temporary-scheduler-bridge
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: vars.WEBHOOK_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify endpoint before starting bridge
+        shell: bash
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$WEBHOOK_URL" == https://* && -n "$WEBHOOK_TOKEN" ]]
+          response=$(mktemp)
+          trap 'rm -f "$response"' EXIT
+          if ! status=$(timeout 240s curl --silent --fail \
+            --output "$response" --write-out '%{http_code}' \
+            --retry 2 --retry-all-errors --retry-max-time 200 \
+            --connect-timeout 10 --max-time 180 --request POST \
+            --header "Authorization: Bearer $WEBHOOK_TOKEN" "$WEBHOOK_URL"); then
+            echo 'Endpoint verification failed; response details remain private.' >&2
+            exit 1
+          fi
+          [[ "$status" == '200' ]]
+          jq -e '.ok == true' "$response" >/dev/null 2>&1
+          echo 'Endpoint confirmed successful processing.'
+
+  bridge:
+    needs: verify
+    # Keep retrying maintenance even if an individual endpoint probe fails.
+    if: always() && vars.WEBHOOK_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      actions: write
+    steps:
+      - name: Maintain five-minute calls until the normal schedule takes over
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$WEBHOOK_URL" == https://* && -n "$WEBHOOK_TOKEN" ]]
+          response=$(mktemp)
+          trap 'rm -f "$response"' EXIT
+
+          scheduled_timer_ready() {
+            local cutoff runs run_id jobs
+            cutoff=$(date -u -d '30 minutes ago' '+%Y-%m-%dT%H:%M:%SZ')
+            runs=$(timeout 20s gh api "repos/$REPOSITORY/actions/workflows/webhook.yml/runs?event=schedule&status=success&per_page=5") || return 1
+            run_id=$(jq -r --arg cutoff "$cutoff" \
+              '[.workflow_runs[] | select(.created_at >= $cutoff and .event == "schedule" and .conclusion == "success")] | .[0].id // empty' <<< "$runs") || return 1
+            [[ -n "$run_id" ]] || return 1
+            jobs=$(timeout 20s gh api "repos/$REPOSITORY/actions/runs/$run_id/jobs") || return 1
+            jq -e '.jobs | any(.name == "invoke" and .conclusion == "success")' <<< "$jobs" >/dev/null 2>&1
+          }
+
+          if scheduled_timer_ready; then
+            echo 'Normal scheduled invocation confirmed; bridge no longer needed.'
+            exit 0
+          fi
+
+          # Queue the successor before waiting, so it survives a runner failure.
+          # Workflow concurrency keeps it pending until this run has finished.
+          # A successor exits without chaining again once the normal timer works.
+          timeout 30s gh workflow run bootstrap.yml --repo "$REPOSITORY" --ref "$BRANCH"
+          echo 'Successor queued; temporary maintenance bridge is active.'
+
+          deadline=$((SECONDS + 3000))
+          while (( SECONDS < deadline )); do
+            started=$SECONDS
+            if scheduled_timer_ready; then
+              echo 'Normal scheduled invocation confirmed; stopping bridge.'
+              exit 0
+            fi
+            if status=$(timeout 240s curl --silent --fail \
+              --output "$response" --write-out '%{http_code}' \
+              --retry 2 --retry-all-errors --retry-max-time 200 \
+              --connect-timeout 10 --max-time 180 --request POST \
+              --header "Authorization: Bearer $WEBHOOK_TOKEN" "$WEBHOOK_URL") \
+              && [[ "$status" == '200' ]] \
+              && jq -e '.ok == true' "$response" >/dev/null 2>&1; then
+              echo 'Endpoint confirmed successful processing.'
+            else
+              echo '::warning::Endpoint invocation failed; bridge will retry. Response details remain private.'
+            fi
+            remaining=$((300 - (SECONDS - started)))
+            if (( remaining > 0 )); then sleep "$remaining"; fi
+          done
+          echo 'Bridge window finished; queued successor will continue.'
